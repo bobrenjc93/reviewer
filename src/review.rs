@@ -552,10 +552,7 @@ async fn plan_checks(
 ) -> Result<CheckPlanDraft> {
     let step = progress.begin_step("phase", "planning checks".to_string());
     let changed_test_files = changed_test_files(pr);
-    let changed_non_test_files = changed_non_test_files(pr);
-    let mandatory_first_check = !changed_test_files.is_empty()
-        && !changed_non_test_files.is_empty()
-        && all_python_tests(&changed_test_files);
+    let _changed_test_files = &changed_test_files;
     progress.set_agent_total(MAX_CHECK_PLAN_ROUNDS);
     let plan_result: Result<CheckPlanDraft> = async {
         let mut checks = Vec::new();
@@ -564,20 +561,8 @@ async fn plan_checks(
         let mut duplicate_rounds = 0usize;
         let mut stop_reason = None::<String>;
 
-        if mandatory_first_check {
-            let mut first_check = build_required_first_check_spec(
-                pr,
-                &worktree.path,
-                &changed_test_files,
-                &changed_non_test_files,
-            );
-            normalize_check_spec(0, &mut first_check);
-            summaries.push(
-                "First check proves the changed tests fail when non-test code changes are reverted."
-                    .to_string(),
-            );
-            checks.push(first_check);
-        }
+        // Regression proof is planned by the LLM using .reviewer.md guidance,
+        // not hardcoded here — keeps the harness project-agnostic.
 
         for round in 0..MAX_CHECK_PLAN_ROUNDS {
             let prompt = build_next_check_prompt(
@@ -1268,69 +1253,6 @@ fn changed_test_files(pr: &PullRequestDetails) -> Vec<String> {
         .collect()
 }
 
-fn changed_non_test_files(pr: &PullRequestDetails) -> Vec<String> {
-    pr.files
-        .iter()
-        .filter(|file| !looks_like_test_file(&file.path))
-        .map(|file| file.path.clone())
-        .collect()
-}
-
-fn all_python_tests(paths: &[String]) -> bool {
-    !paths.is_empty() && paths.iter().all(|path| path.ends_with(".py"))
-}
-
-fn build_required_first_check_spec(
-    pr: &PullRequestDetails,
-    worktree_path: &std::path::Path,
-    changed_test_files: &[String],
-    changed_non_test_files: &[String],
-) -> CheckSpec {
-    let repo_root = shell_single_quote(&worktree_path.display().to_string());
-    let base_ref = shell_single_quote(&format!("origin/{}", pr.base_ref_name));
-    let reverted_files = shell_join_paths(changed_non_test_files);
-    let pytest_args = shell_join_paths(changed_test_files);
-
-    let command = format!(
-        "set -euo pipefail\n\
-repo_root={repo_root}\n\
-base_ref={base_ref}\n\
-tmpdir=$(mktemp -d \"${{TMPDIR:-/tmp}}/reviewer-regression-proof-XXXXXX\")\n\
-cleanup() {{ git -C \"$repo_root\" worktree remove --force \"$tmpdir\" >/dev/null 2>&1 || rm -rf \"$tmpdir\"; }}\n\
-trap cleanup EXIT\n\
-git -C \"$repo_root\" worktree add --detach \"$tmpdir\" HEAD >/dev/null 2>&1\n\
-cd \"$tmpdir\"\n\
-git checkout \"$base_ref\" -- {reverted_files}\n\
-set +e\n\
-python -m pytest {pytest_args}\n\
-status=$?\n\
-set -e\n\
-if [ \"$status\" -eq 0 ]; then\n\
-  echo \"Changed tests still passed after reverting non-test files; expected failure.\" >&2\n\
-  exit 1\n\
-fi\n\
-echo \"Changed tests failed after reverting non-test files, as expected.\"\n"
-    );
-
-    CheckSpec {
-        name: "Regression proof: changed tests fail without the code change".to_string(),
-        command,
-        rationale: format!(
-            "Prove the changed tests actually encode the bug fix by keeping the PR tests, reverting the non-test files ({}) to the base branch in a disposable worktree, and confirming the tests fail there.",
-            changed_non_test_files.join(", ")
-        ),
-        expected_signal: format!(
-            "The command should succeed only if the changed tests ({}) fail after the non-test files are reverted to the base branch.",
-            changed_test_files.join(", ")
-        ),
-        related_findings: changed_test_files
-            .iter()
-            .cloned()
-            .chain(changed_non_test_files.iter().cloned())
-            .collect(),
-    }
-}
-
 fn shell_join_paths(paths: &[String]) -> String {
     paths
         .iter()
@@ -1593,7 +1515,8 @@ fn build_next_check_prompt(
          - If there are no more worthwhile non-interactive checks, set `done` to true and omit `check`.\n\
          - Every returned check must include a non-empty `name` and a non-empty `command`.\n\
          - Use the exact keys `name`, `command`, `rationale`, `expected_signal`, and `related_findings` inside `check`. Do not substitute alternate key names.\n\
-         - If there are no existing planned checks, the first useful check should run the added or modified tests that most directly encode the changed behavior, because those tests should have failed before the patch. If a hard-coded regression-proof check is already present in `Checks already planned`, do not duplicate it.\n\
+         - If there are no existing planned checks AND the PR changes both test and non-test files, the first check MUST be a regression proof: revert the non-test files to the base branch (`git checkout origin/{base} -- <non-test files>`), run the changed tests, then restore (`git checkout HEAD -- <non-test files>`). The test should fail after reverting, proving it encodes the fix. Use the environment setup from the global reviewer instructions.\n\
+         - If there are no existing planned checks AND the PR only changes test files (no non-test files), the first check should just run the changed tests directly.\n\
          - Commands must be non-interactive shell commands that can be run from the worktree with `bash -lc`.\n\
          - Do not use shell pipelines that can hide failures. If you need a pipeline, preserve failures with `set -o pipefail`.\n\
          - Use the build phase result plus repo-specific guidance from the global reviewer instructions when choosing commands.\n\
@@ -1923,7 +1846,7 @@ fn line_range_label(comment: &InlineComment) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckPlanDraft, CheckSpec, build_required_first_check_spec, fallback_check_plan_summary,
+        CheckPlanDraft, CheckSpec, fallback_check_plan_summary,
         is_duplicate_check, summarize_checks, validate_check_plan,
         wrap_check_command_for_execution,
     };
@@ -1964,58 +1887,6 @@ mod tests {
     fn summarize_checks_handles_zero_checks() {
         let summary = summarize_checks("Planner found no safe follow-up checks.", &[]);
         assert!(summary.contains("No post-review checks were executed."));
-    }
-
-    #[test]
-    fn required_first_check_reverts_code_and_runs_changed_tests() {
-        let pr = PullRequestDetails {
-            number: 180670,
-            title: "Example".to_string(),
-            url: "https://github.com/pytorch/pytorch/pull/180670".to_string(),
-            body: String::new(),
-            base_ref_name: "main".to_string(),
-            head_ref_name: "branch".to_string(),
-            head_ref_oid: "abc123".to_string(),
-            files: vec![
-                ChangedFile {
-                    path: "test/dynamo/test_autograd_function.py".to_string(),
-                    additions: 10,
-                    deletions: 0,
-                },
-                ChangedFile {
-                    path: "torch/_dynamo/variables/higher_order_ops.py".to_string(),
-                    additions: 20,
-                    deletions: 3,
-                },
-            ],
-        };
-
-        let check = build_required_first_check_spec(
-            &pr,
-            Path::new("/tmp/reviewer-pr-180670"),
-            &["test/dynamo/test_autograd_function.py".to_string()],
-            &["torch/_dynamo/variables/higher_order_ops.py".to_string()],
-        );
-
-        assert!(check.name.contains("Regression proof"));
-        assert!(
-            check
-                .command
-                .contains("git -C \"$repo_root\" worktree add --detach \"$tmpdir\" HEAD")
-        );
-        assert!(check.command.contains(
-            "git checkout \"$base_ref\" -- 'torch/_dynamo/variables/higher_order_ops.py'"
-        ));
-        assert!(
-            check
-                .command
-                .contains("python -m pytest 'test/dynamo/test_autograd_function.py'")
-        );
-        assert!(
-            check
-                .command
-                .contains("Changed tests still passed after reverting non-test files")
-        );
     }
 
     #[test]
