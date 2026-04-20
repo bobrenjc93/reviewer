@@ -196,6 +196,10 @@ async fn try_main() -> Result<()> {
                 run_logger.root().display()
             ),
         );
+
+        // Print the final review to stdout so it's visible without opening the file
+        println!("{markdown}");
+
         Ok(())
     }
     .await;
