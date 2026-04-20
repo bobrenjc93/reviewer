@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tooling
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build static Linux binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package release artifact
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="reviewer-x86_64-unknown-linux-musl.tar.gz"
+          tar -C target/x86_64-unknown-linux-musl/release -czf "dist/${ARCHIVE}" reviewer
+          printf '%s\n' "${VERSION}" > dist/VERSION.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/reviewer-x86_64-unknown-linux-musl.tar.gz
+            dist/VERSION.txt
