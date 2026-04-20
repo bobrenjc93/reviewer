@@ -227,27 +227,29 @@ pub async fn run_review(
     }
 
     let mut run_result = async {
-        progress.set_agent_total(1);
-        let build = execute_build_phase(
+        // Prepare file review jobs before the build so reviews can run in parallel
+        let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
+
+        // Run build and file reviews concurrently — reviews only read diffs/source,
+        // they don't need the built artifact.
+        progress.set_agent_total(1 + jobs.len());
+        let build_fut = execute_build_phase(
             &options,
             &pr,
             &worktree,
             &base_worktree.worktree,
             provider.clone(),
             progress.clone(),
-        )
-        .await?;
-        let jobs = prepare_file_jobs(&pr, &worktree, progress.clone()).await?;
-        progress.set_agent_total(jobs.len());
-        let file_reviews = review_files(
+        );
+        let review_fut = review_files(
             &options,
             &pr,
             &worktree,
             jobs,
             provider.clone(),
             progress.clone(),
-        )
-        .await?;
+        );
+        let (build, file_reviews) = tokio::try_join!(build_fut, review_fut)?;
         let check_plan = plan_checks(
             &options,
             &pr,
